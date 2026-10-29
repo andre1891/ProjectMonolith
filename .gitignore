@@ -17,6 +17,8 @@
 !/server_launcher.bat
 !/client_launcher.bat
 !/deckbuilder.bat
+!/server_launcher.sh
+!/client_launcher.sh
 
 !/tools/
 /tools/*

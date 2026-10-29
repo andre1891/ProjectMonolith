@@ -18,6 +18,8 @@
 #include <unordered_map>
 #include <set>
 #include <vector>
+#include <tlhelp32.h>
+#include <psapi.h>
 #include <cmath>
 #include <string>
 #include <fstream>
@@ -178,6 +180,9 @@ static inline CardNullSink& CardLog() { static CardNullSink s; return s; }
 namespace Settings {
     const int NUM_PLAYERS_TO_START = 10;
 }
+
+// Forward decl: tick-stall watchdog counter (defined near OnGameInit).
+static volatile LONG g_tickAliveCounter = 0;
 
 namespace SDKUtils {
     template <typename T>
@@ -1011,7 +1016,9 @@ static std::string ServerTimeStamp() {
     SYSTEMTIME st;
     GetLocalTime(&st);
     char buf[16];
-    sprintf_s(buf, "%02u:%02u:%02u.%03u", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    // snprintf (portable) with explicit size: the MSVC-only sprintf_s form did not
+    // compile under MinGW.
+    snprintf(buf, sizeof(buf), "%02u:%02u:%02u.%03u", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
     return std::string(buf);
 }
 
@@ -1178,6 +1185,7 @@ namespace Networking {
 
             for (FNetworkObjectInfo* actorInfo : ConsiderList) {
                 AActor* Actor = actorInfo->actor;
+                if (!Actor || (uintptr_t)Actor == ~(uintptr_t)0) continue;
 
                 UActorChannel* Channel = nullptr;
 
@@ -1185,7 +1193,10 @@ namespace Networking {
                 for (ConnectionChannels ccs : connectionChannels) {
                     if (ccs.connection == connection) {
                         for (UActorChannel* ch : *ccs.channels) {
-                            if (ch->Actor == Actor) {
+                            // channel entries can hold a -1 sentinel when native
+                            // channel creation failed (real client connections);
+                            // never dereference those.
+                            if (ch && (uintptr_t)ch != ~(uintptr_t)0 && ch->Actor == Actor) {
                                 Channel = ch;
                                 break;
                             }
@@ -1193,7 +1204,32 @@ namespace Networking {
                         break;
                     }
                 }
-                
+
+                // Also honor channels the NATIVE engine opened for this actor. The vector
+                // above only tracks channels WE created; without this check we call
+                // CREATE_CHANNEL + SET_CHANNEL_ACTOR on top of a live native channel, which
+                // corrupts its bunching ("Received invalid swap message with child index -1",
+                // "Server connection received: ActorChannelFailure") and wedges the tick.
+                if (!Channel && !IsBadReadPtr((char*)connection + 0x78, 8)) {
+                    __try {
+                        void* chData = *reinterpret_cast<void**>((char*)connection + 0x70);
+                        int32_t chCount = *reinterpret_cast<int32_t*>((char*)connection + 0x78);
+                        if (chData && chCount > 0 && chCount < 4096) {
+                            for (int k = 0; k < chCount; k++) {
+                                UChannel* nch = reinterpret_cast<UChannel*>(reinterpret_cast<void**>(chData)[k]);
+                                if (!nch || (uintptr_t)nch == ~(uintptr_t)0) continue;
+                                void* nchActor = nullptr;
+                                if (!IsBadReadPtr((char*)nch + 0x68, 8))
+                                    nchActor = *reinterpret_cast<void**>((char*)nch + 0x68);
+                                if (nchActor == (void*)Actor) {
+                                    Channel = reinterpret_cast<UActorChannel*>(nch);
+                                    break;
+                                }
+                            }
+                        }
+                    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+                }
+
 
                 if (Actor->NetTag != NetTag) {
                     Actor->NetTag = NetTag;
@@ -1222,6 +1258,8 @@ namespace Networking {
 
         for (int j = 0; j < PriorityActors.size(); j++) {
             UActorChannel* Channel = PriorityActors[j].channel;
+            // -1 sentinel from a failed native channel creation: treat as no channel
+            if ((uintptr_t)Channel == ~(uintptr_t)0) Channel = nullptr;
 
             if (!Channel || Channel->Actor) {
                 AActor* Actor = PriorityActors[j].actor;
@@ -1240,7 +1278,7 @@ namespace Networking {
                 if (Channel == nullptr && Actor) {
                     Channel = reinterpret_cast<UActorChannel * (*)(UNetConnection*, EChannelType, bool, int)>(Globals::ModuleBase + PLOffsets::CREATE_CHANNEL)(Connection, EChannelType::CHTYPE_Actor, true, -1);
 
-                    if (Channel) {
+                    if (Channel && (uintptr_t)Channel != ~(uintptr_t)0) {
                         reinterpret_cast<void(*)(UActorChannel*, AActor*)>(Globals::ModuleBase + PLOffsets::SET_CHANNEL_ACTOR)(Channel, Actor);
 
                         bool found = false;
@@ -1383,7 +1421,7 @@ namespace Networking {
                 continue;
             }
 
-            if (Connection->PlayerController) {
+            if (Connection->PlayerController && (uintptr_t)Connection->PlayerController != ~(uintptr_t)0) {
                 reinterpret_cast<void(*)(APlayerController*)>(Globals::ModuleBase + PLOffsets::SEND_CLIENT_ADJUSTMENT)(Connection->PlayerController);
             }
 
@@ -1407,6 +1445,12 @@ namespace Networking {
 }
 
 namespace Hooking {
+    // Bots may only exist if the host explicitly pressed F1. The engine can also
+    // spawn AI on its own (e.g. auto-filling empty teams when a match starts);
+    // without this gate a full 5v5 of bots leaves no slot for a joining player.
+    static volatile LONG g_f1BotsArmed = 0;
+    static volatile LONG g_botBlockLogged = 0;
+
     bool procingCurrentFuncPtrs = false;
 
     static std::vector<void*> FuncPtrsToProcInGameThread = std::vector<void*>();
@@ -1667,14 +1711,63 @@ namespace Hooking {
             faultAddr = (void*)ep->ExceptionRecord->ExceptionInformation[1];
         }
 
+        // Wine stub exceptions (EXCEPTION_WINE_STUB family, 0x4001000X) are raised by
+        // kernelbase spec-relay thunks when the engine calls an API this Wine build
+        // has no implementation for. Dump the raw ExceptionInformation values (safe
+        // struct reads) so info[0] can be resolved to module+RVA and the API name read
+        // from disk. Also attempt a validated in-process string read: only dereference
+        // if the pointer is inside a known loaded module AND at least 64 bytes from the
+        // end of its image (no IsBadReadPtr - it is unreliable in exception context).
+        unsigned long long info64[4] = { 0, 0, 0, 0 };
+        {
+            const unsigned long long* ip =
+                reinterpret_cast<const unsigned long long*>(ep->ExceptionRecord->ExceptionInformation);
+            int maxp = ep->ExceptionRecord->NumberParameters; if (maxp > 4) maxp = 4;
+            for (int i = 0; i < maxp; i++) info64[i] = ip[i];
+        }
+        char stubName[129] = { 0 };
+        if (info64[0] >= 0x10000ULL && info64[0] < 0x7FFFFFFFFFFFULL) {
+            HMODULE hm = nullptr;
+            if (GetModuleHandleExA(0x4 | 0x2, (LPCSTR)info64[0], &hm) && hm) {
+                IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)hm;
+                unsigned long long imgSize = 0;
+                if ((unsigned short)dos->e_magic == 0x5A4D && dos->e_lfanew < 0x1000) {
+                    IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)((char*)hm + dos->e_lfanew);
+                    imgSize = nt->OptionalHeader.SizeOfImage;
+                }
+                unsigned long long offInImg = info64[0] - (unsigned long long)hm;
+                if (imgSize > 0 && offInImg + 64 < imgSize) {
+                    const char* s = reinterpret_cast<const char*>(info64[0]);
+                    for (int i = 0; i < 64; i++) {
+                        stubName[i] = s[i];
+                        if (s[i] == 0) break;
+                    }
+                }
+            }
+        }
+        // If the probe read a UTF-16 string (zero bytes at odd offsets), convert it.
+        if (stubName[0] && (unsigned char)stubName[1] == 0) {
+            char conv[65]; int cn = 0;
+            for (int i = 0; i + 1 < 64 && stubName[i] != 0 && cn < 63; i += 2)
+                if ((unsigned char)stubName[i + 1] == 0) conv[cn++] = stubName[i];
+            conv[cn] = 0;
+            if (cn > 0) { memset(stubName, 0, sizeof(stubName)); memcpy(stubName, conv, cn + 1); }
+        }
+
         unsigned long long rva = 0;
         if (Globals::ModuleBase != 0 && (uintptr_t)pc >= Globals::ModuleBase) {
             rva = (unsigned long long)((uintptr_t)pc - Globals::ModuleBase);
         }
 
-        printf("[SEH-ENGINE-TICK-CRASH] Code=0x%08lX PC=%p RVA=0x%llX ModBase=0x%llX FaultAddr=%p RW=%llu Tick=%llu Shadows=%zu\n",
-            code, pc, rva, (unsigned long long)Globals::ModuleBase, faultAddr, readWrite, tick, shadowCount);
+        printf("[SEH-ENGINE-TICK-CRASH] Code=0x%08lX PC=%p RVA=0x%llX ModBase=0x%llX FaultAddr=%p RW=%llu Tick=%llu Shadows=%zu Stub='%s' Info=[0x%llX 0x%llX 0x%llX 0x%llX] np=%u\n",
+            code, pc, rva, (unsigned long long)Globals::ModuleBase, faultAddr, readWrite, tick, shadowCount, stubName,
+            info64[0], info64[1], info64[2], info64[3], ep->ExceptionRecord->NumberParameters);
         fflush(stdout);
+        if (stubName[0]) {
+            FILE* sf = nullptr;
+            fopen_s(&sf, "/tmp/seh_stub_api.txt", "w");
+            if (sf) { fprintf(sf, "%s\n", stubName); fclose(sf); }
+        }
 
         FILE* f = nullptr;
         fopen_s(&f, "seh_crash.txt", "ab");
@@ -1682,9 +1775,10 @@ namespace Hooking {
             SYSTEMTIME st;
             GetLocalTime(&st);
             fprintf(f, "[%04u-%02u-%02u %02u:%02u:%02u.%03u] [SEH-ENGINE-TICK-CRASH] "
-                "Code=0x%08lX PC=%p RVA=0x%llX ModBase=0x%llX FaultAddr=%p RW=%llu Tick=%llu Shadows=%zu\n",
+                "Code=0x%08lX PC=%p RVA=0x%llX ModBase=0x%llX FaultAddr=%p RW=%llu Tick=%llu Shadows=%zu Stub='%s' Info=[0x%llX 0x%llX 0x%llX 0x%llX] np=%u\n",
                 st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds,
-                code, pc, rva, (unsigned long long)Globals::ModuleBase, faultAddr, readWrite, tick, shadowCount);
+                code, pc, rva, (unsigned long long)Globals::ModuleBase, faultAddr, readWrite, tick, shadowCount, stubName,
+                info64[0], info64[1], info64[2], info64[3], ep->ExceptionRecord->NumberParameters);
             fflush(f);
             fclose(f);
         }
@@ -2266,10 +2360,69 @@ namespace Hooking {
 
     void* origNetDriverTickFlush = nullptr;
 
+    // Ability-trace hook integrity watchdog (temporary diagnostics): 2026-10-29 trace round
+    // proved the factory body executed (helperB return addr 0x3F4CE5) while the factory entry
+    // hook never logged -> its MinHook patch was not effective at runtime (failed enable or
+    // reverted by runtime .text rewriting). Re-check both targets every 2 s on the game thread;
+    // log + re-enable anything that is not patched.
+    static void AbCheckHooksAlive() {
+        static ULONGLONG s_last = 0;
+        static int s_reverts[2] = {0, 0};
+        ULONGLONG now = GetTickCount64();
+        if (now - s_last < 2000) return;
+        s_last = now;
+        struct T { const char* name; void* target; } ts[2] = {
+            {"factory", (void*)(Globals::ModuleBase + 0x3F4C60)},
+            {"helperB", (void*)(Globals::ModuleBase + 0x3C0460)},
+        };
+        for (int i = 0; i < 2; i++) {
+            unsigned char* p = (unsigned char*)ts[i].target;
+            if (p[0] != 0xE9) {
+                if (s_reverts[i] < 10) {
+                    FILE* f = fopen("/tmp/server_ability_trace.txt", "a");
+                    if (f) {
+                        fprintf(f, "[HOOK-REVERTED] %s @%p firstBytes=%02X %02X %02X %02X %02X -> re-enabling (count=%d)\n",
+                                ts[i].name, ts[i].target, p[0], p[1], p[2], p[3], p[4], s_reverts[i] + 1);
+                        fclose(f);
+                    }
+                }
+                s_reverts[i]++;
+                MH_EnableHook(ts[i].target);
+            }
+        }
+    }
+
     void NetDriverTickFlushHook(__int64 NetDriver, float DeltaTime) {
         reinterpret_cast<void(*)(__int64, float)>(origNetDriverTickFlush)(NetDriver, DeltaTime);
+        AbCheckHooksAlive();
 
-        Networking::ServerReplicateActors();
+        // Wine compatibility history: an early version of this pass created
+        // duplicate channels on top of live native ones, corrupting bunching
+        // (ActorChannelFailure / invalid-swap). The pass now REUSES live native
+        // OpenChannels entries, and it is REQUIRED under Wine because native
+        // engine replication opens PlayerController channels but never
+        // PlayerState channels - without the pass a real client connects but
+        // can never receive its PlayerState. The Linux launchers export
+        // PM_EXTRA_REPL=1. Default stays enabled so Windows behavior is
+        // unchanged; PM_NO_EXTRA_REPL=1 forces it OFF for diagnostics.
+        static int s_extraRepl = -1;
+        if (s_extraRepl < 0) {
+            // PM_NO_EXTRA_REPL=1 is a hard OFF for diagnostics (wins over everything).
+            // Otherwise an explicit PM_EXTRA_REPL=<n> decides, and the default is ON.
+            const char* force = getenv("PM_EXTRA_REPL");
+            const char* e = getenv("PM_NO_EXTRA_REPL");
+            if (e && *e && atoi(e) != 0) s_extraRepl = 0;
+            else if (force && *force) s_extraRepl = atoi(force) ? 1 : 0;
+            else s_extraRepl = 1;
+        }
+        if (!s_extraRepl) return;
+
+        // Contain ANY exception here regardless: a failing extra pass must
+        // never abort the engine tick.
+        __try {
+            Networking::ServerReplicateActors();
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
 
     struct PlayerInfo {
@@ -2849,6 +3002,7 @@ namespace Hooking {
     static volatile int s_vehCatchCount = 0;
 
     int GameEngineTickHook(UGameEngine* gameengine, float deltatime, char a3) {
+        InterlockedIncrement(&g_tickAliveCounter);
 
         if (deltatime > 0.2f) {
             std::cout << "[SERVER-HITCH] " << ServerTimeStamp() << " Tick " << deltatime << " s" << std::endl;
@@ -2922,9 +3076,155 @@ namespace Hooking {
                 for (int i = 0; i < Networking::GetNetDriver()->ClientConnections.Count(); i++) {
                     UNetConnection* conn = Networking::GetNetDriver()->ClientConnections[i];
                     if (conn && conn->PlayerController) {
-                        InstallUnPossessHook(reinterpret_cast<AController*>(conn->PlayerController));
+                        AController* sc = reinterpret_cast<AController*>(conn->PlayerController);
+                        { FILE* mf = fopen("/tmp/server_marker_player.txt", "w");
+                          if (mf) { fprintf(mf, "client connection WITH PlayerController seen tick=%lu count=%d serverPS=%d pawn=%d\n",
+                                           GetTickCount(), (int)Networking::GetNetDriver()->ClientConnections.Count(),
+                                           sc->PlayerState ? 1 : 0, sc->Pawn ? 1 : 0); fclose(mf); } }
+                        InstallUnPossessHook(sc);
                         break;
                     }
+                }
+            }
+        }
+
+        // High-frequency replication-flag tracker around login: sample every 250 ms
+        // for up to ~60 s after the first connection appears. Logs PC/PS pointers,
+        // class names, bReplicates (0xA8 bit3), RemoteRole (0x85) and NetDormancy
+        // (0x119); flags any change so we can see exactly when bReplicates flips.
+        {
+            static DWORD s_loginTrackStart = 0;
+            static DWORD s_lastSample = 0;
+            static void* s_lastPC = nullptr, *s_lastPS = nullptr;
+            static int s_lastPCRepl = -1, s_lastPSRepl = -1;
+            UNetDriver* nd3 = Networking::GetNetDriver();
+            bool hasConn = nd3 && nd3->ClientConnections.Count() > 0;
+            if (hasConn) {
+                if (!s_loginTrackStart) s_loginTrackStart = GetTickCount();
+                DWORD age = GetTickCount() - s_loginTrackStart;
+                if (age < 60000 && GetTickCount() - s_lastSample >= 250) {
+                    s_lastSample = GetTickCount();
+                    UNetConnection* conn = nd3->ClientConnections[0];
+                    AController* sc = conn ? reinterpret_cast<AController*>(conn->PlayerController) : nullptr;
+                    void* pc = (void*)sc, *ps = sc ? (void*)sc->PlayerState : nullptr;
+                    int pcRepl = -1, psRepl = -1, pcRole = -1, psRole = -1, pcDorm = -1, psDorm = -1;
+                    std::string pcCls, psCls;
+                    if (pc && !IsBadReadPtr(pc, 0x120)) {
+                        __try {
+                            pcRepl = (*reinterpret_cast<uint8_t*>((char*)pc + 0x82) >> 5) & 1;
+                            pcRole = *reinterpret_cast<uint8_t*>((char*)pc + 0x118);
+                            pcDorm = *reinterpret_cast<uint8_t*>((char*)pc + 0x119);
+                            UObject* c = reinterpret_cast<UObject*>(pc)->Class;
+                            if (c) pcCls = c->GetName();
+                        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+                    }
+                    if (ps && !IsBadReadPtr(ps, 0x120)) {
+                        __try {
+                            psRepl = (*reinterpret_cast<uint8_t*>((char*)ps + 0x82) >> 5) & 1;
+                            psRole = *reinterpret_cast<uint8_t*>((char*)ps + 0x118);
+                            psDorm = *reinterpret_cast<uint8_t*>((char*)ps + 0x119);
+                            UObject* c = reinterpret_cast<UObject*>(ps)->Class;
+                            if (c) psCls = c->GetName();
+                        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+                    }
+                    bool changed = (pc != s_lastPC || ps != s_lastPS || pcRepl != s_lastPCRepl || psRepl != s_lastPSRepl);
+                    if (changed || age < 5000) {
+                        FILE* mf = fopen("/tmp/server_marker_login.txt", "a");
+                        if (mf) {
+                            fprintf(mf, "%lu +%lums pc=%p(%s repl=%d role=%d dorm=%d) ps=%p(%s repl=%d role=%d dorm=%d)%s\n",
+                                    GetTickCount(), (long)age, pc, pcCls.c_str(), pcRepl, pcRole, pcDorm,
+                                    ps, psCls.c_str(), psRepl, psRole, psDorm, changed ? "  <- CHANGE" : "");
+                            fclose(mf);
+                        }
+                    }
+                    s_lastPC = pc; s_lastPS = ps; s_lastPCRepl = pcRepl; s_lastPSRepl = psRepl;
+                }
+            }
+        }
+
+        // Continuous connection tracker: every ~5 s log the server-side linkage
+        // (conn -> PC -> PS/Pawn and whether PC->NetConnection still points back
+        // at conn). Tells us if/when the server tears down the player session.
+        {
+            static DWORD s_lastConnDump = 0;
+            UNetDriver* nd = Networking::GetNetDriver();
+            if (nd && nd->ClientConnections.Count() > 0 && GetTickCount() - s_lastConnDump >= 5000) {
+                s_lastConnDump = GetTickCount();
+                FILE* mf = fopen("/tmp/server_marker_conn.txt", "a");
+                if (mf) {
+                    for (int i = 0; i < nd->ClientConnections.Count(); i++) {
+                        UNetConnection* conn = nd->ClientConnections[i];
+                        if (!conn) { fprintf(mf, "%lu conn[%d]=NULL\n", GetTickCount(), i); continue; }
+                        AController* sc = reinterpret_cast<AController*>(conn->PlayerController);
+                        void* pcNetConn = (sc && !IsBadReadPtr((char*)sc + 0x530, 8))
+                                           ? *reinterpret_cast<void**>((char*)sc + 0x530) : nullptr;
+                        // BISECT: OwningActor read/fix temporarily reverted (suspected tick-freeze
+                        // correlation). Plain linkage dump only.
+                        fprintf(mf, "%lu conn[%d]=%p pc=%p ps=%p pawn=%p pcNetConnBack=%d\n",
+                                GetTickCount(), i, (void*)conn, (void*)sc,
+                                sc ? (void*)sc->PlayerState : nullptr,
+                                sc ? (void*)sc->Pawn : nullptr,
+                                (pcNetConn == (void*)conn) ? 1 : 0);
+                    }
+                    fclose(mf);
+                }
+            }
+        }
+
+        // Replication channel enumerator: every ~5 s list all live UActorChannel
+        // objects (they are UObjects, so they live in GObjects) with their bound
+        // actor. If no channel exists for the player's PlayerState, the server
+        // never replicates it - channel-level proof either way.
+        {
+            static DWORD s_lastChDump = 0;
+            if (GetTickCount() - s_lastChDump >= 5000) {
+                s_lastChDump = GetTickCount();
+                FILE* mf = fopen("/tmp/server_marker_channels.txt", "a");
+                if (mf) {
+                    std::vector<UActorChannel*> chs;
+                    for (UActorChannel* c : SDKUtils::GetAllObjectsOfType<UActorChannel>()) if (c) chs.push_back(c);
+                    fprintf(mf, "%lu nCh=%zu\n", GetTickCount(), chs.size());
+                    for (UActorChannel* c : chs) {
+                        void* actor = nullptr;
+                        if (!IsBadReadPtr((char*)c + 0x68, 8)) actor = *reinterpret_cast<void**>((char*)c + 0x68);
+                        std::string anm;
+                        if (actor && !IsBadReadPtr(actor, 0x20)) {
+                            __try { anm = reinterpret_cast<AActor*>(actor)->GetName(); }
+                            __except (EXCEPTION_EXECUTE_HANDLER) {}
+                        }
+                        fprintf(mf, "  ch=%p actor=%p %s\n", (void*)c, actor, anm.empty() ? "?" : anm.c_str());
+                    }
+                    // Correct AActor offsets: bReplicates=0x82 bit5, NetRole(Role)=0x118,
+                    // RemoteRole=0x85, NetDormancy=0x119. (An earlier 0xA8 read was wrong -
+                    // that byte is inside FRepMovement.) Controls: GameState + GameMode are
+                    // known-replicating actors; if they read bReplicates=1 the offset is right.
+                    AActor* ctlGS = nullptr; AActor* ctlGM = nullptr;
+                    if (Globals::GetGWorld() && Globals::GetGWorld()->AuthorityGameMode) {
+                        ctlGM = reinterpret_cast<AActor*>(Globals::GetGWorld()->AuthorityGameMode);
+                        ctlGS = reinterpret_cast<AActor*>(Globals::GetGWorld()->AuthorityGameMode->GameState);
+                    }
+                    int gsRepl=-1, gmRepl=-1, gsNR=-1, gmNR=-1;
+                    if (ctlGS && !IsBadReadPtr((char*)ctlGS, 0x120)) { __try { gsRepl=(*reinterpret_cast<uint8_t*>((char*)ctlGS+0x82)>>5)&1; gsNR=*reinterpret_cast<uint8_t*>((char*)ctlGS+0x118); } __except(EXCEPTION_EXECUTE_HANDLER){} }
+                    if (ctlGM && !IsBadReadPtr((char*)ctlGM, 0x120)) { __try { gmRepl=(*reinterpret_cast<uint8_t*>((char*)ctlGM+0x82)>>5)&1; gmNR=*reinterpret_cast<uint8_t*>((char*)ctlGM+0x118); } __except(EXCEPTION_EXECUTE_HANDLER){} }
+                    fprintf(mf, "  CTRL GameState=%p bReplicates=%d netRole=%d\n", (void*)ctlGS, gsRepl, gsNR);
+                    fprintf(mf, "  CTRL GameMode =%p bReplicates=%d netRole=%d\n", (void*)ctlGM, gmRepl, gmNR);
+
+                    UNetDriver* nd2 = Networking::GetNetDriver();
+                    if (nd2 && nd2->ClientConnections.Count() > 0) {
+                        UNetConnection* conn = nd2->ClientConnections[0];
+                        AController* sc = conn ? reinterpret_cast<AController*>(conn->PlayerController) : nullptr;
+                        int pcRepl=-1, psRepl=-1, pcNR=-1, psNR=-1, pcRR=-1, psRR=-1;
+                        if (sc && !IsBadReadPtr((char*)sc, 0x120)) {
+                            __try { pcRepl=(*reinterpret_cast<uint8_t*>((char*)sc+0x82)>>5)&1; pcNR=*reinterpret_cast<uint8_t*>((char*)sc+0x118); pcRR=*reinterpret_cast<uint8_t*>((char*)sc+0x85); } __except(EXCEPTION_EXECUTE_HANDLER){}
+                        }
+                        if (sc && sc->PlayerState && !IsBadReadPtr((char*)sc->PlayerState, 0x120)) {
+                            __try { psRepl=(*reinterpret_cast<uint8_t*>((char*)sc->PlayerState+0x82)>>5)&1; psNR=*reinterpret_cast<uint8_t*>((char*)sc->PlayerState+0x118); psRR=*reinterpret_cast<uint8_t*>((char*)sc->PlayerState+0x85); } __except(EXCEPTION_EXECUTE_HANDLER){}
+                        }
+                        fprintf(mf, "  playerPC=%p bReplicates=%d netRole=%d remoteRole=%d\n", (void*)sc, pcRepl, pcNR, pcRR);
+                        if (sc && sc->PlayerState)
+                            fprintf(mf, "  playerPS=%p bReplicates=%d netRole=%d remoteRole=%d\n", (void*)sc->PlayerState, psRepl, psNR, psRR);
+                    }
+                    fclose(mf);
                 }
             }
         }
@@ -2934,6 +3234,7 @@ namespace Hooking {
         static bool mapInit = false;
         static bool waitingForMatchInit = false;
         static float matchInitTimer = 0.0f;
+        static ULONGLONG matchInitDeadline = 0;
 
         static const bool ENABLE_AUTO_MAPLOAD = true;
         static const float AUTO_MAPLOAD_DELAY = 3.0f;
@@ -2978,16 +3279,25 @@ namespace Hooking {
                 std::cout << "[HOST] F8 gedrueckt: Map laedt. Starte 20-Sekunden-Timer fuer MatchInit..." << std::endl;
 
             waitingForMatchInit = true;
+            // Wall-clock deadline: under Wine the engine's tick rate collapses
+            // while it waits for the map load, so the game-time timer below can
+            // stall for minutes and OnMatchInit (which opens UDP 7777) never
+            // runs. The async asset loaders run on their own threads and finish
+            // within this window, so real time is a safe trigger. Windows
+            // behavior is unchanged: the game-time timer fires first as before.
+            matchInitDeadline = GetTickCount64() + 15000;
         }
 
         if (waitingForMatchInit && !mapInit) {
             matchInitTimer += deltatime;
 
-            if (matchInitTimer >= 10.0f) {
+            bool due = matchInitTimer >= 10.0f || GetTickCount64() >= matchInitDeadline;
+            if (due) {
                 mapInit = true;
                 waitingForMatchInit = false;
 
-                std::cout << "[HOST] 20 Sekunden vergangen: OnMatchInit() wird jetzt automatisch ausgefuehrt!" << std::endl;
+                std::cout << "[HOST] MatchInit-Timer erreicht (game-time=" << matchInitTimer
+                          << " s, wall-clock-Fallback aktiviert) - OnMatchInit() wird jetzt automatisch ausgefuehrt!" << std::endl;
                 OnMatchInit();
             }
         }
@@ -2999,6 +3309,8 @@ namespace Hooking {
 
         if (GetAsyncKeyState(VK_F1) && !didTheFunny) {
             didTheFunny = true;
+            // Arm bot spawning from now on (SpawnBotHook blocks everything else).
+            InterlockedExchange(&g_f1BotsArmed, 1);
             GBotRoles.clear();
             ShadowBots.clear();
 
@@ -4277,7 +4589,7 @@ namespace Hooking {
                 if (automationTimer >= 20.0f && !frankensteinTriggered) {
                     frankensteinTriggered = true;
                     std::cout << "[HOST] Automatik (20s): Ernte Karten von Schatten-Bots..." << std::endl;
-                    Hooking::ProcInGameThread(StealBotDeckForHumans);
+                    Hooking::ProcInGameThread(reinterpret_cast<void*>(StealBotDeckForHumans));
                 }
 
             if (automationTimer >= 55.0f && !aiCommanderTriggered) {
@@ -14599,6 +14911,15 @@ else if (bIsJungler) {
     }
     void* origSpawnBot = nullptr;
     AOrionAIBot* SpawnBotHook(UOrionAISystem* a1, UOrionHeroData* a2, EOrionTeam a3, EAIBotDifficulty a4, FVector a5, FRotator a6) {
+        // Bots only populate if F1 was pressed. Block any native auto-fill so
+        // real players always have a free slot to join.
+        if (!g_f1BotsArmed) {
+            if (InterlockedCompareExchange(&g_botBlockLogged, 1, 0) == 0) {
+                std::cout << "[HOST] Bot-Spawn blockiert (F1 nicht gedrueckt) - Team bleibt fuer Spieler frei."
+                          << std::endl;
+            }
+            return nullptr;
+        }
         botHeroDataOverride = a2;
         return reinterpret_cast<AOrionAIBot * (*)(UOrionAISystem * a1, UOrionHeroData * a2, EOrionTeam a3, EAIBotDifficulty a4, FVector a5, FRotator a6)>(origSpawnBot)(a1, a2, a3, a4, a5, a6);
 
@@ -14613,9 +14934,92 @@ else if (bIsJungler) {
         return Globals::overrideTeamBuilderInfoCheck && (a1->TeamIndex == EOrionTeam::TeamRed || a1->TeamIndex == EOrionTeam::TeamBlue);
     }
 
+    // ================= AbilityTask crash tracing (temporary diagnostics) =================
+    // Server crashes on `movzbl (%r14)` at ModuleBase+0x3F4CED when a client uses an ability.
+    // The function at 0x3F4C60 is a UAbilityTask factory: arg1 = task, [arg1+0x20] = task->Outer,
+    // [arg1+0x28] = task->ThisAbility, arg3 (r8/r14) = ptr to a uint8 written into result+0xA0.
+    // 2026-10-29 trace round: the crashing call arrived with arg3 == NULL (R14=0 at fault,
+    // FaultAddr=0); R8/R9 in the crash context are leftovers from helper_B's subtree, not args.
+    // The factory body provably ran yet the factory entry hook never logged -> its MinHook patch
+    // was NOT effective at runtime. AbCheckHooksAlive() (in NetDriverTickFlushHook) re-checks both
+    // patches every 2 s and re-enables anything reverted. These hooks log every interesting
+    // invocation (args + true return address + Outer/ThisAbility) to /tmp/server_ability_trace.txt.
+    static void AbTrace(const char* tag, void* retaddr, __int64 a1, __int64 a2, __int64 a3, __int64 a4, void* outer, void* thisAbility) {
+        FILE* f = fopen("/tmp/server_ability_trace.txt", "a");
+        if (!f) return;
+        fprintf(f, "%s ret=%p a1=%p a2=%llx a3=%llx a4=%llx outer=%p thisAbility=%p\n",
+                tag, retaddr, (void*)a1, a2, a3, a4, outer, thisAbility);
+        fclose(f);
+    }
+
+    void* origAbFactory = nullptr;
+    static __declspec(noinline) __int64 AbFactoryHook(__int64 a1, __int64 a2, __int64 a3, __int64 a4) {
+        void* retaddr = __builtin_return_address(0);
+        static int s_total = 0, s_logged = 0;
+        ++s_total;
+        void* outer = a1 ? *(void**)(a1 + 0x20) : nullptr;
+        void* thisAbility = a1 ? *(void**)(a1 + 0x28) : nullptr;
+        bool interesting = (s_logged < 40) || !outer || ((unsigned __int64)a3 < 0x10000);
+        if (interesting && s_logged < 500) {
+            ++s_logged;
+            AbTrace("FACTORY", retaddr, a1, a2, a3, a4, outer, thisAbility);
+        }
+        return reinterpret_cast<__int64(__fastcall*)(__int64, __int64, __int64, __int64)>(origAbFactory)(a1, a2, a3, a4);
+    }
+
+    void* origAbHelperB = nullptr;
+    static __declspec(noinline) __int64 AbHelperBHook(__int64 a1, __int64 a2) {
+        void* retaddr = __builtin_return_address(0);
+        static int s_total = 0, s_logged = 0;
+        ++s_total;
+        if (s_logged < 50 || !a1) {
+            if (s_logged < 500) {
+                ++s_logged;
+                AbTrace("HELPERB", retaddr, a1, a2, 0, 0,
+                        a1 ? *(void**)(a1 + 0x20) : nullptr,
+                        a1 ? *(void**)(a1 + 0x28) : nullptr);
+            }
+        }
+        __int64 r = reinterpret_cast<__int64(__fastcall*)(__int64, __int64)>(origAbHelperB)(a1, a2);
+        if (s_logged < 500) {
+            FILE* f = fopen("/tmp/server_ability_trace.txt", "a");
+            if (f) {
+                fprintf(f, "HELPERB-RET ret=%p a1=%p result=%p\n", retaddr, (void*)a1, (void*)r);
+                fclose(f);
+            }
+        }
+        return r;
+    }
+
+    // Wine's OutputDebugStringA/W implementation RAISES a pseudo-exception
+    // (0x40010006 ANSI / 0x4001000A wide) carrying the message string so a debugger
+    // can see it. Under our setup that exception escapes through the engine tick and
+    // aborts it on every log line, wedging the whole game loop after map load (the
+    // [SEH-ENGINE-TICK-CRASH] storm with Info=[len, msgPtr]). Hooking both to a no-op
+    // stops the raises entirely; the messages are still visible in the console log.
+    static DWORD OutputDebugStringAHook(const char* s) { (void)s; return 1; }
+    static DWORD OutputDebugStringWHook(const wchar_t* s) { (void)s; return 1; }
 
     void InitHooking() {
         MH_Initialize();
+
+        // Hook OutputDebugStringA/W: resolve via kernel32 first, fall back to
+        // kernelbase. If both modules expose different addresses, hook both so no
+        // call path can reach the exception-raising implementation.
+        {
+            HMODULE k32 = GetModuleHandleA("kernel32.dll");
+            HMODULE kbase = GetModuleHandleA("kernelbase.dll");
+            void* pA = (void*)GetProcAddress(k32 ? k32 : GetModuleHandleA(nullptr), "OutputDebugStringA");
+            void* pW = (void*)GetProcAddress(k32 ? k32 : GetModuleHandleA(nullptr), "OutputDebugStringW");
+            void* pbA = kbase ? (void*)GetProcAddress(kbase, "OutputDebugStringA") : nullptr;
+            void* pbW = kbase ? (void*)GetProcAddress(kbase, "OutputDebugStringW") : nullptr;
+            if (pA) { MH_CreateHook(pA, reinterpret_cast<void*>(OutputDebugStringAHook), nullptr); MH_EnableHook(pA); }
+            if (pW) { MH_CreateHook(pW, reinterpret_cast<void*>(OutputDebugStringWHook), nullptr); MH_EnableHook(pW); }
+            if (pbA && pbA != pA) { MH_CreateHook(pbA, reinterpret_cast<void*>(OutputDebugStringAHook), nullptr); MH_EnableHook(pbA); }
+            if (pbW && pbW != pW) { MH_CreateHook(pbW, reinterpret_cast<void*>(OutputDebugStringWHook), nullptr); MH_EnableHook(pbW); }
+            std::cout << "[INIT] OutputDebugString-Hooks: k32 A=" << (void*)pA << " W=" << (void*)pW
+                      << "  kbase A=" << pbA << " W=" << pbW << std::endl;
+        }
 
         void* ProcessEventHookLocal = (void*)(Globals::ModuleBase + PLOffsets::PROCESSEVENT);
 
@@ -14772,6 +15176,22 @@ else if (bIsJungler) {
         MH_CreateHook(teamBuilderInfo, reinterpret_cast<void*>(TeamBuilderInfoCheck), &origTeamBuilderInfo);
 
         MH_EnableHook(teamBuilderInfo);
+
+        // AbilityTask crash tracing (temporary diagnostics)
+        {
+            void* abFactory = (void*)(Globals::ModuleBase + 0x3F4C60);
+            MH_STATUS sfc = MH_CreateHook(abFactory, reinterpret_cast<void*>(AbFactoryHook), &origAbFactory);
+            MH_STATUS sfe = (sfc == MH_OK) ? MH_EnableHook(abFactory) : sfc;
+            void* abHelperB = (void*)(Globals::ModuleBase + 0x3C0460);
+            MH_STATUS shc = MH_CreateHook(abHelperB, reinterpret_cast<void*>(AbHelperBHook), &origAbHelperB);
+            MH_STATUS she = (shc == MH_OK) ? MH_EnableHook(abHelperB) : shc;
+            unsigned char fbF = ((unsigned char*)abFactory)[0];
+            unsigned char fbH = ((unsigned char*)abHelperB)[0];
+            std::cout << "[INIT] AbilityTask-trace hooks: factory=" << abFactory
+                      << " (create=" << sfc << ", enable=" << sfe << ", firstByte=0x" << std::hex << fbF << ")"
+                      << " helperB=" << abHelperB
+                      << " (create=" << shc << ", enable=" << she << ", firstByte=0x" << fbH << std::dec << ")" << std::endl;
+        }
     }
 }
 
@@ -14824,7 +15244,12 @@ void InitConsole() {
     }
 }
 
+// Set when OnMatchInit has run; the console-nudge thread stops once this is true.
+static volatile LONG g_mapInitDone = 0;
+
 void OnMatchInit() {
+    InterlockedExchange(&g_mapInitDone, 1);
+
     std::cout << "Setting up teams..." << std::endl;
     GameLogic::SetupTeams();
 
@@ -14833,6 +15258,119 @@ void OnMatchInit() {
 
     std::cout << "Listening for connections..." << std::endl;
     Networking::Listen();
+}
+
+// Under Wine the engine's game thread repeatedly blocks on a console-input read
+// (CONIN$) once the map load starts, so GameEngine::Tick stops being called and
+// any tick-based trigger (including OnMatchInit, which opens UDP 7777) never
+// runs. Whether it resumes on its own is a race: some runs recover, most don't.
+// This thread unblocks the engine by writing a newline to CONIN$ every few
+// seconds until OnMatchInit has run (the in-tick wall-clock deadline then fires
+// it on the game thread). The injected newline is an empty console line, which
+// the engine ignores. On Windows the condition clears within ~10 s and at most
+// one harmless newline is ever written.
+static DWORD WINAPI MatchInitNudgeThread(LPVOID) {
+    // Give startup + the auto map load time to begin (we load ~90 s after the
+    // game starts; the map load begins ~15-20 s after that).
+    Sleep(90 * 1000);
+    for (int i = 0; i < 600 && !g_mapInitDone; i++) {   // up to ~30 min
+        Sleep(3000);
+        if (g_mapInitDone) break;
+        HANDLE h = CreateFileA("CONIN$", GENERIC_WRITE,
+                               FILE_SHARE_READ | FILE_SHARE_WRITE,
+                               nullptr, OPEN_EXISTING, 0, nullptr);
+        if (h != INVALID_HANDLE_VALUE) {
+            DWORD written = 0;
+            WriteFile(h, "\n", 1, &written, nullptr);
+            CloseHandle(h);
+        }
+    }
+    return 0;
+}
+
+// --- tick-stall watchdog ------------------------------------------------------
+// If the game thread stops ticking for >15 s, dump every thread's state/wchan to
+// /tmp/server_tickwatchdog.txt so a hang shows WHERE (spinning LWP vs kernel wait).
+// (g_tickAliveCounter is defined at file scope near the top of this file.)
+
+static DWORD WINAPI TickWatchdogThread(LPVOID) {
+    LONG last = 0;
+    ULONGLONG lastChange = GetTickCount64();
+    HMODULE selfMod = GetModuleHandleA("Server.dll");
+    for (;;) {
+        Sleep(5000);
+        LONG cur = g_tickAliveCounter;
+        if (cur != last) { last = cur; lastChange = GetTickCount64(); continue; }
+        ULONGLONG stuck = GetTickCount64() - lastChange;
+        if (stuck < 15000) continue;
+        // Wine cannot open /proc/self/task/<tid>/stat from inside the process, so
+        // sample the main (game) thread's RIP directly: snapshot threads, find the
+        // thread whose TID == PID, suspend it for a GetThreadContext, resume.
+        FILE* f = fopen("/tmp/server_tickwatchdog.txt", "a");
+        if (!f) { Sleep(30000); continue; }
+        fprintf(f, "=== TICK STALL tickcount=%lu stuck=%llus winepid=%lu ===\n",
+                (unsigned long)cur, (unsigned long long)(stuck / 1000), (unsigned long)GetCurrentProcessId());
+        // Wine does not guarantee main-thread TID == PID, so sample EVERY thread of
+        // this process and log RIP + owning module for each. Module list via
+        // EnumProcessModulesEx so we can name wine builtins vs game code.
+        HMODULE mods[128]; DWORD modBytes = 0;
+        if (EnumProcessModulesEx(GetCurrentProcess(), mods, sizeof(mods), &modBytes, LIST_MODULES_ALL)) {
+            int nMods = (int)(modBytes / sizeof(HMODULE));
+            for (int sample = 0; sample < 2; sample++) {
+                if (sample) Sleep(3000);
+                HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+                if (snap == INVALID_HANDLE_VALUE) { fprintf(f, "  snapshot failed\n"); break; }
+                THREADENTRY32 te; te.dwSize = sizeof(te);
+                BOOL found = Thread32First(snap, &te);
+                int nLogged = 0;
+                while (found && nLogged < 64) {
+                    if (te.th32OwnerProcessID == GetCurrentProcessId()) {
+                        HANDLE th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, te.th32ThreadID);
+                        if (th) {
+                            CONTEXT ctx; ZeroMemory(&ctx, sizeof(ctx)); ctx.ContextFlags = CONTEXT_ALL;
+                            ULONG susp = SuspendThread(th);
+                            BOOL got = GetThreadContext(th, &ctx);
+                            if (susp != (ULONG)-1) ResumeThread(th);
+                            CloseHandle(th);
+                            if (got) {
+                                ULONGLONG rip = ctx.Rip;
+                                const char* modName = "?"; unsigned long long modOff = 0;
+                                for (int m = 0; m < nMods; m++) {
+                                    char mp[MAX_PATH]; DWORD ml = GetModuleFileNameA(mods[m], mp, MAX_PATH);
+                                    if (!ml) continue;
+                                    ULONGLONG base = (ULONGLONG)mods[m];
+                                    // rough size: next module base - this one, or 64MiB cap
+                                    ULONGLONG sz = 0x4000000ULL;
+                                    for (int m2 = 0; m2 < nMods; m2++) {
+                                        if (mods[m2] > mods[m]) {
+                                            ULONGLONG cand = (ULONGLONG)mods[m2] - base;
+                                            if (cand < sz) sz = cand;
+                                        }
+                                    }
+                                    if (rip >= base && rip < base + sz) {
+                                        modName = mp; modOff = (unsigned long long)(rip - base);
+                                        break;
+                                    }
+                                }
+                                fprintf(f, "  s%d tid=%lu RIP=0x%llx %s+0x%llx gameRVA=0x%llx%s\n",
+                                        sample, (unsigned long)te.th32ThreadID, (unsigned long long)rip,
+                                        modName, modOff, (unsigned long long)(rip - Globals::ModuleBase),
+                                        (selfMod && rip >= (ULONGLONG)selfMod && rip < (ULONGLONG)selfMod + 0x2000000ULL) ? " [IN Server.dll]" : "");
+                                nLogged++;
+                            }
+                        }
+                    }
+                    found = Thread32Next(snap, &te);
+                }
+                CloseHandle(snap);
+            }
+        } else {
+            fprintf(f, "  EnumProcessModulesEx failed\n");
+        }
+        fclose(f);
+        Sleep(60000); // one report per stall episode
+    }
+    return 0;
 }
 
 void OnGameInit() {
@@ -14874,6 +15412,15 @@ void Main() {
 
     Hooking::InitHooking();
 
+    // Unblocks the engine's blocking console-input read under Wine so the game
+    // thread keeps ticking after the map load (see MatchInitNudgeThread).
+    HANDLE nudge = CreateThread(nullptr, 0, MatchInitNudgeThread, nullptr, 0, nullptr);
+    if (nudge) CloseHandle(nudge);
+
+    // Tick-stall watchdog: reports to /tmp/server_tickwatchdog.txt if the game
+    // thread stops ticking for >15 s (diagnoses the post-login hang under Wine).
+    HANDLE wd = CreateThread(nullptr, 0, TickWatchdogThread, nullptr, 0, nullptr);
+    if (wd) CloseHandle(wd);
 
     Sleep(1 * 1000 * 1000 * 1000);
 
@@ -14882,15 +15429,47 @@ void Main() {
     }
 }
 
+// --- thread start that is safe in DllMain ------------------------------------
+// Do NOT use std::thread here: under Wine 11, CreateThread while holding the
+// loader lock can fail or raise (EXCEPTION_WINE_STUB), and a joinable
+// std::thread destroyed during unwinding calls std::terminate("terminate
+// called without an active exception"), killing the game process. Raw
+// CreateThread has no C++ objects to unwind; if it is unavailable anyway, the
+// start is deferred to a WH_GETMESSAGE hook, which runs in a normal thread
+// context (no loader lock). On Windows the direct CreateThread succeeds and
+// behavior is unchanged.
+static DWORD WINAPI MainTrampoline(LPVOID) { Main(); return 0; }
+
+static HHOOK s_deferHook = nullptr;
+static LRESULT CALLBACK DeferredStartProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION && s_deferHook) {
+        UnhookWindowsHookEx(s_deferHook);
+        s_deferHook = nullptr;
+        HANDLE h = CreateThread(nullptr, 0, MainTrampoline, nullptr, 0, nullptr);
+        if (h) CloseHandle(h);
+    }
+    return CallNextHookEx(nullptr, nCode, wParam, lParam);
+}
+
+static void StartMainOrDefer() {
+    HANDLE h = nullptr;
+    __try {
+        h = CreateThread(nullptr, 0, MainTrampoline, nullptr, 0, nullptr);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        h = nullptr;   // e.g. Wine loader-lock stub exception
+    }
+    if (h) { CloseHandle(h); return; }
+    s_deferHook = SetWindowsHookExW(WH_GETMESSAGE, DeferredStartProc,
+                                    GetModuleHandleW(nullptr), 0);
+}
+
 BOOL APIENTRY DllMain( HMODULE hModule,
                        DWORD  ul_reason_for_call,
                        LPVOID lpReserved
                      )
 {
     if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
-        std::thread t(Main);
-
-        t.detach();
+        StartMainOrDefer();
     }
     return TRUE;
 }

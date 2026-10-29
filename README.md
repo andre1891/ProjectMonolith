@@ -79,6 +79,45 @@ not modify files on disk. The server listens on UDP port 7777.
 Playing alone against bots also works this way: you host the server and join it yourself
 on the same PC (see "Playing solo against bots" in HOW_TO_PLAY.md).
 
+**Linux / Wine:** everything above also runs under Wine — see [Running on Linux (Wine)](#running-on-linux-wine).
+On Linux the loader is `xinput1_3.dll` instead of `DXGI.dll`, and the launchers are
+`server_launcher.sh` / `client_launcher.sh`.
+
+## Running on Linux (Wine)
+
+The whole project runs under **Wine**. Hosting a match and joining it from the same PC has been
+verified end-to-end (Fedora 44, Wine 11 staging + DXVK, AMD GPU/Vulkan). You still need your own,
+legitimately obtained copy of the v45 client.
+
+**Prerequisites** (Fedora example; other distros similar):
+
+```bash
+sudo dnf install wine dxvk   # full metapackage - do NOT install bare wine-core
+```
+
+Two failure modes if you skip the metapackage:
+- missing `wine-common` → `wineboot --init` livelocks at 99% CPU and every wine launch hangs;
+- missing `wine-ldap` → the game exits instantly with code 53 and an empty log.
+
+**Building:** cross-compile with **mingw-w64** (`x86_64-w64-mingw32-g++`, C++20). GCC has no
+native SEH, so the sources need a mechanical `__try/__except` transform plus small portability
+shims; that cross-build pipeline is build machinery and is kept outside this repository on
+purpose. Alternatively build the DLLs on Windows and copy them over — they are plain PE DLLs.
+
+**Loader difference:** under Wine the game's DXGI/D3D11 path is taken over by DXVK, so a local
+`DXGI.dll` is **never loaded** there (no rename or `WINEDLLOVERRIDES` changes that). On Linux the
+loader is therefore `xinput1_3.dll` in the game folder: the game imports XINPUT1_3, Wine prefers
+the app-dir native DLL over its builtin stub, and the shim loads `Server.dll` (server exe) or
+`Client.dll` (client exe) once the engine is ready. On Windows, `DXGI.dll` stays the loader as
+before; both files can sit in the same folder.
+
+**Launching:** use `server_launcher.sh` / `client_launcher.sh` (Linux ports of the `.bat`
+launchers, same prompts). They add `-noepicportal -skippatchcheck`, which are **required under
+Wine** (the Epic handshake cannot complete without them), and the server launcher sets
+`PM_NO_EXTRA_REPL=1`: with real client connections under Wine the extra shadow-bot replication
+pass must stay off — native engine replication carries the session. Windows builds and launchers
+are unaffected by that variable.
+
 ## How the bot AI works
 
 `ai_documentation_EN.txt` describes the reconstructed bot macro brain in `Server/dllmain.cpp`:

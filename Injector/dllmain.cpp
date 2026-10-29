@@ -33,27 +33,6 @@ void InitializeOriginalFunctions() {
     }
 }
 
-extern "C" HRESULT __stdcall CreateDXGIFactoryFake(REFIID riid, void** ppFactory) {
-    if (g_pOrigCreateDXGIFactory) {
-        return g_pOrigCreateDXGIFactory(riid, ppFactory);
-    }
-    return E_FAIL;
-}
-
-extern "C" HRESULT __stdcall CreateDXGIFactory1Fake(REFIID riid, void** ppFactory) {
-    if (g_pOrigCreateDXGIFactory1) {
-        return g_pOrigCreateDXGIFactory1(riid, ppFactory);
-    }
-    return E_FAIL;
-}
-
-extern "C" HRESULT __stdcall CreateDXGIFactory2Fake(UINT Flags, REFIID riid, void** ppFactory) {
-    if (g_pOrigCreateDXGIFactory2) {
-        return g_pOrigCreateDXGIFactory2(Flags, riid, ppFactory);
-    }
-    return E_FAIL;
-}
-
 void InjectionThread() {
     if ((uintptr_t)GetModuleHandleA("OrionClient-Win64-Shipping-Server.exe")) {
         std::this_thread::sleep_for(std::chrono::seconds(25));
@@ -65,10 +44,47 @@ void InjectionThread() {
     }
 }
 
+// The injection thread is spawned from the first CreateDXGIFactory* call (the
+// engine's render init) instead of from DllMain(DLL_PROCESS_ATTACH). Spawning a
+// thread while holding the loader lock during early process init fails under
+// Wine 11 (EXCEPTION_WINE_STUB, the thread never starts), and deferring to a
+// normal execution context is safe on Windows too: the payload DLLs wait for
+// engine readiness on their own, so the few seconds of extra delay are
+// harmless.
+static volatile LONG g_spawned = 0;
+static void TrySpawnInjection() {
+    if (InterlockedCompareExchange(&g_spawned, 1, 0) == 0) {
+        std::thread(InjectionThread).detach();
+    }
+}
+
+extern "C" HRESULT __stdcall CreateDXGIFactoryFake(REFIID riid, void** ppFactory) {
+    TrySpawnInjection();
+    if (g_pOrigCreateDXGIFactory) {
+        return g_pOrigCreateDXGIFactory(riid, ppFactory);
+    }
+    return E_FAIL;
+}
+
+extern "C" HRESULT __stdcall CreateDXGIFactory1Fake(REFIID riid, void** ppFactory) {
+    TrySpawnInjection();
+    if (g_pOrigCreateDXGIFactory1) {
+        return g_pOrigCreateDXGIFactory1(riid, ppFactory);
+    }
+    return E_FAIL;
+}
+
+extern "C" HRESULT __stdcall CreateDXGIFactory2Fake(UINT Flags, REFIID riid, void** ppFactory) {
+    TrySpawnInjection();
+    if (g_pOrigCreateDXGIFactory2) {
+        return g_pOrigCreateDXGIFactory2(Flags, riid, ppFactory);
+    }
+    return E_FAIL;
+}
+
 void Main() {
     InitializeOriginalFunctions();
-
-    std::thread(InjectionThread).detach();
+    // Injection thread spawn happens in TrySpawnInjection (first factory call).
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule,
