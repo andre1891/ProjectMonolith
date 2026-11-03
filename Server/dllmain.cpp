@@ -821,6 +821,94 @@ namespace DamageCalculations {
         };
         static std::vector<DeferredConfirm> deferredConfirms;
 
+        static const bool ENABLE_STALE_TASK_SKIP = true;
+
+        static bool TaskIsLive(UObject* t) {
+            return t && !IsBadReadPtr(t, sizeof(UObject)) && UObject::GObjects->GetByIndex(t->Index) == t;
+        }
+
+        static bool TaskIsStale(UObject* t) {
+            if (!ENABLE_STALE_TASK_SKIP) return false;
+            if (!TaskIsLive(t)) return true;
+            if (static_cast<int32>(t->Flags) & 0x10) return false;
+            const uintptr_t ta = reinterpret_cast<uintptr_t>(t);
+            if (IsBadReadPtr(reinterpret_cast<void*>(ta + 0x68), 8)) return true;
+            UObject* ab = *reinterpret_cast<UObject**>(ta + 0x68);
+            if (!ab || !TaskIsLive(ab)) return true;
+            const uintptr_t aa = reinterpret_cast<uintptr_t>(ab);
+            if (IsBadReadPtr(reinterpret_cast<void*>(aa + 0x5D8), 1)) return true;
+            return *reinterpret_cast<uint8_t*>(aa + 0x5D8) == 0;
+        }
+
+        static const bool ENABLE_SAME_ABILITY_CONFIRM = true;
+        static bool ccSrcActive = false;
+        static UClass* ccSrcClass = nullptr;
+        static int ccSrcType = -1;
+        static std::map<void*, UClass*> ccPendingSrc;
+        static std::set<std::pair<void*, void*>> ccInputAbil;
+
+        struct AimPendingEntry { const char* entry; float x, y, z; long long tick; };
+        static std::map<void*, AimPendingEntry> aimPending;
+        static bool AimFixMoveTm(UOrionAbilityTask_StartTargeting* t, float x, float y, float z) {
+            const uintptr_t ta = reinterpret_cast<uintptr_t>(t);
+            UObject* tm = IsBadReadPtr(reinterpret_cast<void*>(ta + 0xB0), 8) ? nullptr : *reinterpret_cast<UObject**>(ta + 0xB0);
+            if (!tm || !TaskIsLive(tm) || !tm->IsA(AOrionTargetingMode_Base::StaticClass())) return false;
+            FVector newLoc; newLoc.X = x; newLoc.Y = y; newLoc.Z = z;
+            reinterpret_cast<AActor*>(tm)->K2_SetActorLocation(newLoc, false, nullptr, true);
+            return true;
+        }
+
+        static bool AscIsHuman(UAbilitySystemComponent* asc) {
+            if (!asc || !IsValidUE4Object(asc)) return false;
+            AActor* av = asc->AvatarActor;
+            if (!av || !IsValidUE4Object(av) || !av->IsA(AOrionCharHero::StaticClass())) return false;
+            AController* c = reinterpret_cast<APawn*>(av)->Controller;
+            return c && IsValidUE4Object(c) && c->IsA(APlayerController::StaticClass());
+        }
+
+        static bool IsAlwaysOnAbilityName(const std::string& n) {
+            return n.find("Passive") != std::string::npos || n.find("EventEvaluator") != std::string::npos
+                || n.find("CombatStatus") != std::string::npos || n.find("ExecuteMinions") != std::string::npos
+                || n.find("_Handler") != std::string::npos;
+        }
+
+        static void CcSetSource(UAbilitySystemComponent* asc, int32_t handle, int type) {
+            ccSrcActive = true;
+            ccSrcClass = nullptr;
+            ccSrcType = type;
+            if (!asc || !IsValidUE4Object(asc)) return;
+            const uintptr_t a = reinterpret_cast<uintptr_t>(asc);
+            if (IsBadReadPtr(reinterpret_cast<void*>(a + 0x520), 16)) return;
+            const uintptr_t d = *reinterpret_cast<uintptr_t*>(a + 0x520);
+            const int32_t n = *reinterpret_cast<int32_t*>(a + 0x528);
+            for (int32_t i = 0; d && i < n && i < 200; ++i) {
+                const uintptr_t sp = d + static_cast<uintptr_t>(i) * 0xC8;
+                if (IsBadReadPtr(reinterpret_cast<void*>(sp), 0x30)) continue;
+                if (*reinterpret_cast<int32_t*>(sp + 0x0C) != handle) continue;
+                UObject* cdo = *reinterpret_cast<UObject**>(sp + 0x10);
+                if (cdo && IsValidUE4Object(cdo)) ccSrcClass = cdo->Class;
+                break;
+            }
+        }
+
+        static void CcClear() { ccSrcActive = false; ccSrcClass = nullptr; ccSrcType = -1; }
+
+        static bool CcIsInputAbility(UAbilitySystemComponent* asc, UClass* cls) {
+            return cls && ccInputAbil.count(std::make_pair(reinterpret_cast<void*>(asc), reinterpret_cast<void*>(cls))) > 0;
+        }
+
+        static bool CcBlock(UObject* task, UAbilitySystemComponent* asc, int expectedType) {
+            if (!ENABLE_SAME_ABILITY_CONFIRM || !ccSrcActive || !AscIsHuman(asc) || !TaskIsLive(task)) return false;
+            const uintptr_t ta = reinterpret_cast<uintptr_t>(task);
+            UObject* ab = IsBadReadPtr(reinterpret_cast<void*>(ta + 0x68), 8) ? nullptr : *reinterpret_cast<UObject**>(ta + 0x68);
+            if (!ab || !TaskIsLive(ab)) return false;
+            const bool foreign = ccSrcClass && ab->Class != ccSrcClass;
+            (void)expectedType;
+            const bool wrongType = ccSrcType == 1;
+            if (!foreign && !wrongType) return false;
+            return CcIsInputAbility(asc, ab->Class);
+        }
+
 
 
         static UFunction* cachedOnTargetDataReadyFunc = nullptr;
@@ -881,10 +969,16 @@ namespace DamageCalculations {
                 }
             }
 
+            std::vector<UOrionAbilityTask_StartTargeting*> ccKeepWaiting;
             for (UOrionAbilityTask_StartTargeting* target : snap) {
                 if (!target) continue;
+                if (TaskIsStale(reinterpret_cast<UObject*>(target))) continue;
                 const std::string tn = target->GetFullName();
                 if (tn.find("Default") == std::string::npos) {
+                    if (CcBlock(reinterpret_cast<UObject*>(target), asc, 0)) {
+                        ccKeepWaiting.push_back(target);
+                        continue;
+                    }
                     std::string s13_ab;
                     if (target->Ability) s13_ab = target->Ability->GetFullName();
                     const bool s13_fd = s13_NeedsForceDeliver(s13_ab);
@@ -899,6 +993,7 @@ namespace DamageCalculations {
                 }
             }
 
+            for (auto* t : ccKeepWaiting) targetingTasks.push_back(t);
             return procdAnAbility;
         }
 
@@ -909,12 +1004,20 @@ namespace DamageCalculations {
             for (auto it = waitTargetDataTasks.begin(); it != waitTargetDataTasks.end(); ) {
                 UObject* task = *it;
 
+                if (TaskIsStale(task)) {
+                    it = waitTargetDataTasks.erase(it);
+                    continue;
+                }
                 if (!task || task->GetFullName().find("Default") != std::string::npos) {
                     it = waitTargetDataTasks.erase(it);
                     continue;
                 }
 
                 if (TaskBelongsToASC(task, reinterpret_cast<UObject*>(asc))) {
+                    if (CcBlock(task, asc, 0)) {
+                        ++it;
+                        continue;
+                    }
 
                     struct {
                         FGameplayAbilityTargetDataHandle Data;
@@ -939,12 +1042,20 @@ namespace DamageCalculations {
             for (auto it = waitInputPressTasks.begin(); it != waitInputPressTasks.end(); ) {
                 UObject* task = *it;
 
+                if (TaskIsStale(task)) {
+                    it = waitInputPressTasks.erase(it);
+                    continue;
+                }
                 if (!task || task->GetFullName().find("Default") != std::string::npos) {
                     it = waitInputPressTasks.erase(it);
                     continue;
                 }
 
                 if (TaskBelongsToASC(task, reinterpret_cast<UObject*>(asc))) {
+                    if (CcBlock(task, asc, 2)) {
+                        ++it;
+                        continue;
+                    }
 
                     reinterpret_cast<void* (__thiscall*)(UObject*, UFunction*, void*)>(origProcessEventPtr)(
                         task, cachedOnPressCallbackFunc, nullptr);
@@ -964,12 +1075,20 @@ namespace DamageCalculations {
             for (auto it = waitInputReleaseTasks.begin(); it != waitInputReleaseTasks.end(); ) {
                 UObject* task = *it;
 
+                if (TaskIsStale(task)) {
+                    it = waitInputReleaseTasks.erase(it);
+                    continue;
+                }
                 if (!task || task->GetFullName().find("Default") != std::string::npos) {
                     it = waitInputReleaseTasks.erase(it);
                     continue;
                 }
 
                 if (TaskBelongsToASC(task, reinterpret_cast<UObject*>(asc))) {
+                    if (CcBlock(task, asc, 3)) {
+                        ++it;
+                        continue;
+                    }
 
                     reinterpret_cast<void* (__thiscall*)(UObject*, UFunction*, void*)>(origProcessEventPtr)(
                         task, cachedOnReleaseCallbackFunc, nullptr);
@@ -997,6 +1116,11 @@ namespace DamageCalculations {
 
             UGameplayAbility* InstancedAbility = nullptr;
             spec->InputPressed = true;
+            if (inputPressed && AscIsHuman(component)) {
+                UObject* inAb = reinterpret_cast<UObject*>(spec->Ability);
+                if (inAb && IsValidUE4Object(inAb) && !IsAlwaysOnAbilityName(inAb->GetName()))
+                    ccInputAbil.insert(std::make_pair(reinterpret_cast<void*>(component), reinterpret_cast<void*>(inAb->Class)));
+            }
 
             if (reinterpret_cast<bool(*)(UAbilitySystemComponent*, FGameplayAbilitySpecHandle, FPredictionKey*, UGameplayAbility**, void*, FGameplayEventData*)>(Globals::ModuleBase + PLOffsets::INTERNAL_TRY_ACTIVATE_ABILITY)(component, Handle, &PredictionKey, &InstancedAbility, nullptr, TriggerEventData)) {
             }
@@ -1161,12 +1285,18 @@ namespace Networking {
         UActorChannel* channel;
     };
 
-    struct ConnectionChannels {
-        UNetConnection* connection;
-        std::vector<UActorChannel*>* channels;
-    };
-
-    static std::vector<ConnectionChannels> connectionChannels = std::vector<ConnectionChannels>();
+    static std::unordered_map<AActor*, UActorChannel*> BuildOpenChannelMap(UNetConnection* connection) {
+        std::unordered_map<AActor*, UActorChannel*> m;
+        if (!connection) return m;
+        TArray<UChannel*>& open = connection->OpenChannels;
+        for (int i = 0; i < open.Count(); ++i) {
+            UChannel* ch = open[i];
+            if (!ch || IsBadReadPtr(ch, sizeof(UActorChannel)) || !ch->IsA(UActorChannel::StaticClass())) continue;
+            AActor* a = reinterpret_cast<UActorChannel*>(ch)->Actor;
+            if (a) m[a] = reinterpret_cast<UActorChannel*>(ch);
+        }
+        return m;
+    }
 
     std::vector<ActorInfo> ServerReplicateActors_PrioritizeActors(UNetConnection* connection, std::vector<FNetworkObjectInfo*> ConsiderList) {
         std::vector<ActorInfo> out = std::vector<ActorInfo>();
@@ -1183,53 +1313,22 @@ namespace Networking {
 
         if (MaxSortedActors > 0) {
 
+            std::unordered_map<AActor*, UActorChannel*> openMap = BuildOpenChannelMap(connection);
+
             for (FNetworkObjectInfo* actorInfo : ConsiderList) {
                 AActor* Actor = actorInfo->actor;
                 if (!Actor || (uintptr_t)Actor == ~(uintptr_t)0) continue;
 
                 UActorChannel* Channel = nullptr;
 
-
-                for (ConnectionChannels ccs : connectionChannels) {
-                    if (ccs.connection == connection) {
-                        for (UActorChannel* ch : *ccs.channels) {
-                            // channel entries can hold a -1 sentinel when native
-                            // channel creation failed (real client connections);
-                            // never dereference those.
-                            if (ch && (uintptr_t)ch != ~(uintptr_t)0 && ch->Actor == Actor) {
-                                Channel = ch;
-                                break;
-                            }
-                        }
-                        break;
-                    }
-                }
-
-                // Also honor channels the NATIVE engine opened for this actor. The vector
-                // above only tracks channels WE created; without this check we call
-                // CREATE_CHANNEL + SET_CHANNEL_ACTOR on top of a live native channel, which
-                // corrupts its bunching ("Received invalid swap message with child index -1",
-                // "Server connection received: ActorChannelFailure") and wedges the tick.
-                if (!Channel && !IsBadReadPtr((char*)connection + 0x78, 8)) {
-                    __try {
-                        void* chData = *reinterpret_cast<void**>((char*)connection + 0x70);
-                        int32_t chCount = *reinterpret_cast<int32_t*>((char*)connection + 0x78);
-                        if (chData && chCount > 0 && chCount < 4096) {
-                            for (int k = 0; k < chCount; k++) {
-                                UChannel* nch = reinterpret_cast<UChannel*>(reinterpret_cast<void**>(chData)[k]);
-                                if (!nch || (uintptr_t)nch == ~(uintptr_t)0) continue;
-                                void* nchActor = nullptr;
-                                if (!IsBadReadPtr((char*)nch + 0x68, 8))
-                                    nchActor = *reinterpret_cast<void**>((char*)nch + 0x68);
-                                if (nchActor == (void*)Actor) {
-                                    Channel = reinterpret_cast<UActorChannel*>(nch);
-                                    break;
-                                }
-                            }
-                        }
-                    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-                }
-
+                // Channel lookup goes through BuildOpenChannelMap(connection) above: it reads
+                // the engine's own OpenChannels list, so channels opened by NATIVE replication
+                // are honored too. Calling CREATE_CHANNEL + SET_CHANNEL_ACTOR on top of a live
+                // native channel corrupts its bunching ("Received invalid swap message with
+                // child index -1", "Server connection received: ActorChannelFailure") and
+                // wedges the tick under Wine - reusing the native entry is mandatory.
+                // (Patch 1.10's map replaces both the old own-list lookup and the earlier
+                // raw-offset OpenChannels scan; its IsBadReadPtr check also skips -1 sentinels.)
 
                 if (Actor->NetTag != NetTag) {
                     Actor->NetTag = NetTag;
@@ -1280,22 +1379,6 @@ namespace Networking {
 
                     if (Channel && (uintptr_t)Channel != ~(uintptr_t)0) {
                         reinterpret_cast<void(*)(UActorChannel*, AActor*)>(Globals::ModuleBase + PLOffsets::SET_CHANNEL_ACTOR)(Channel, Actor);
-
-                        bool found = false;
-                        for (ConnectionChannels ccs : connectionChannels) {
-                            if (ccs.connection == Connection) {
-                                found = true;
-                                ccs.channels->push_back(Channel);
-                            }
-                        }
-
-                        if (!found) {
-                            connectionChannels.push_back(ConnectionChannels());
-                            connectionChannels.back().channels = new std::vector<UActorChannel*>();
-                            connectionChannels.back().channels->push_back(Channel);
-                            connectionChannels.back().connection = Connection;
-                        }
-
                     }
                 }
 
@@ -2057,6 +2140,50 @@ namespace Hooking {
         if (funcNameIt == s_funcNameCache.end())
             funcNameIt = s_funcNameCache.emplace(function, function->GetFullName()).first;
         const std::string& funcName = funcNameIt->second;
+        static const bool ENABLE_BUFF_APPLY_FIX = true;
+        if (ENABLE_BUFF_APPLY_FIX && params && funcName.size() > 11
+            && funcName.compare(funcName.size() - 11, 11, ".OnPickedUp") == 0
+            && object->IsA(AOrionPickup::StaticClass())) {
+            UObject* bfPawn = *reinterpret_cast<UObject**>(params);
+            void* bfRet = reinterpret_cast<void* (__thiscall*)(UObject*, UFunction*, void*)>(origProcessEvent)(object, function, params);
+            const uintptr_t pk = reinterpret_cast<uintptr_t>(object);
+            if (IsBadReadPtr(reinterpret_cast<void*>(pk + 0x440), 0x20) || IsBadReadPtr(reinterpret_cast<void*>(pk + 0x468), 0x10)
+                || IsBadReadPtr(reinterpret_cast<void*>(pk + 0x530), 1))
+                return bfRet;
+            const int carried = *reinterpret_cast<uint8_t*>(pk + 0x530);
+            const int hBefore = *reinterpret_cast<int32_t*>(pk + 0x468 + 8);
+            if (carried < 2 || hBefore != 0 || !bfPawn || !IsValidUE4Object(bfPawn) || !bfPawn->IsA(AActor::StaticClass()))
+                return bfRet;
+            const int32_t srcIdx = *reinterpret_cast<int32_t*>(pk + 0x440 + 0x10);
+            UObject* bfSrc = (srcIdx > 0 && UObject::GObjects && srcIdx < UObject::GObjects->Num())
+                           ? UObject::GObjects->GetByIndex(srcIdx) : nullptr;
+            if (!bfSrc || !IsValidUE4Object(bfSrc) || !bfSrc->IsA(AActor::StaticClass())) bfSrc = object;
+            const uintptr_t fData = *reinterpret_cast<uintptr_t*>(pk + 0x440);
+            const int32_t   fNum  = *reinterpret_cast<int32_t*>(pk + 0x440 + 8);
+            int tried = 0;
+            for (int32_t i = 0; i < fNum && i < 8 && fData; ++i) {
+                const uintptr_t f = fData + static_cast<uintptr_t>(i) * 0x90;
+                if (IsBadReadPtr(reinterpret_cast<void*>(f), 0x90)) break;
+                const uintptr_t sData = *reinterpret_cast<uintptr_t*>(f + 0x80);
+                const int32_t   sNum  = *reinterpret_cast<int32_t*>(f + 0x88);
+                for (int32_t k = 0; k < sNum && k < 8 && sData; ++k) {
+                    const uintptr_t h = sData + static_cast<uintptr_t>(k) * 0x18;
+                    if (IsBadReadPtr(reinterpret_cast<void*>(h), 0x18)) break;
+                    void* spec = *reinterpret_cast<void**>(h);
+                    if (!spec || IsBadReadPtr(spec, sizeof(void*))) continue;
+                    UObject* def = *reinterpret_cast<UObject**>(spec);
+                    if (!def || !IsValidUE4Object(def)) continue;
+                    FGameplayEffectSpecHandle handle;
+                    memcpy(&handle, reinterpret_cast<void*>(h), sizeof(handle));
+                    reinterpret_cast<AOrionPickup*>(object)->TryToApplyGameplayEffectSpecToTarget(
+                        handle, reinterpret_cast<AActor*>(bfSrc), reinterpret_cast<AActor*>(bfPawn));
+                    ++tried;
+                }
+            }
+            F4_LOG_EVENT("[BUFF-APPLY-FIX] " << ServerTimeStamp() << " pickup=" << object->GetName()
+                << " carriedType=" << carried << " ziel=" << bfPawn->GetName() << " angewendet=" << tried << std::endl);
+            return bfRet;
+        }
         if (funcName.find("ServerSetSelectedDeckItem") != std::string::npos) {
             return nullptr;
         }
@@ -2202,6 +2329,9 @@ namespace Hooking {
                 g_lastSSRTPredKey = *reinterpret_cast<int16_t*>(reinterpret_cast<uint8_t*>(params) + 0x08);
             }
 
+            bool aimHave = false;
+            float aimX = 0.f, aimY = 0.f, aimZ = 0.f;
+            std::string aimAb;
             if (!IsBadReadPtr(params, 0x10)) {
                 int32_t ssrtHandle = *reinterpret_cast<int32_t*>(params);
                 int16_t origCur  = *reinterpret_cast<int16_t*>(reinterpret_cast<uint8_t*>(params) + 0x08);
@@ -2240,6 +2370,7 @@ namespace Hooking {
                         t2x = *reinterpret_cast<float*>(td0 + 0x50);
                         t2y = *reinterpret_cast<float*>(td0 + 0x54);
                         t2z = *reinterpret_cast<float*>(td0 + 0x58);
+                        aimHave = true; aimX = t2x; aimY = t2y; aimZ = t2z; aimAb = ssrtAb;
                         uintptr_t arrData = *reinterpret_cast<uintptr_t*>(td0 + 0x78);
                         num = *reinterpret_cast<int32_t*>(td0 + 0x80);
                         if (arrData && num > 0 && num < 256 && !IsBadReadPtr(reinterpret_cast<void*>(arrData), 4)) {
@@ -2281,7 +2412,37 @@ namespace Hooking {
 
             }
 
+            const char* aimPendEntry = nullptr;
+            {
+                static const bool ENABLE_AIM_FIX = true;
+                static const char* kAimFixList[] = { "GA_Riftmage_Meteor", "GA_Hammer_Subjugate",
+                                                     "GA_Gadget_ElectroGate", "GA_Gadget_Ultimate",
+                                                     "GA_Muriel_ConsGround",
+                                                     "GA_Sparrow_RainOfArrows",
+                                                     "GA_Steel_Ultimate",
+                                                     "GA_Kwang_Sword_C",
+                                                     "GA_HyperBreach_Ultimate_C", "GA_HyperBreach_DetCharge_C",
+                                                     "GA_Totem_Ultimate_C", "GA_Totem_SlowField_C", "GA_Pyro_Turret_v2_C",
+                                                     "GA_Sword_LeapAOE_C", "GA_Venus_Growth_C", "GA_Venus_Ultimate_V2_C",
+                                                     "GA_Tacticia_ManaBomb_C",
+                                                     "GA_FallenAngel_Ascend_C", "GA_FallenAngel_Chastise_C", "GA_FallenAngel_Fury_C" };
+                const char* aimEntry = nullptr;
+                for (const char* a : kAimFixList) if (aimAb.find(a) != std::string::npos) aimEntry = a;
+                if (ENABLE_AIM_FIX && aimHave && aimEntry) {
+                    bool aimDone = false;
+                    for (auto* t : GameplayAbilities::targetingTasks) {
+                        if (!t || !GameplayAbilities::TaskIsLive(reinterpret_cast<UObject*>(t)) || t->AbilitySystemComponent != castObj) continue;
+                        if (!t->Ability || reinterpret_cast<UObject*>(t->Ability)->GetFullName().find(aimEntry) == std::string::npos) continue;
+                        if (GameplayAbilities::AimFixMoveTm(t, aimX, aimY, aimZ)) aimDone = true;
+                    }
+                    if (!aimDone) aimPendEntry = aimEntry;
+                }
+            }
+            if (!IsBadReadPtr(params, 4))
+                GameplayAbilities::CcSetSource(castObj, *reinterpret_cast<int32_t*>(params), -1);
             bool triggered = GameplayAbilities::TriggerAbilities(castObj);
+            if (aimPendEntry) GameplayAbilities::aimPending[castObj] = { aimPendEntry, aimX, aimY, aimZ, g_diagTickCounter };
+            else GameplayAbilities::aimPending.erase(castObj);
 
 
             bool ssrt_alreadyPending = false;
@@ -2299,6 +2460,12 @@ namespace Hooking {
                 }
                 if (!ssrt_alreadyPending) {
                     GameplayAbilities::pendingConfirmASCs.push_back({ castObj, nowTick });
+                    GameplayAbilities::ccPendingSrc[castObj] = GameplayAbilities::ccSrcClass;
+                }
+                else {
+                    auto ps = GameplayAbilities::ccPendingSrc.find(castObj);
+                    if (ps != GameplayAbilities::ccPendingSrc.end() && ps->second && ps->second != GameplayAbilities::ccSrcClass)
+                        ps->second = nullptr;
                 }
             }
 
@@ -2308,6 +2475,7 @@ namespace Hooking {
 
             GameplayAbilities::ForwardTargetDataToWaitTasks(
                 castObj, origProcessEvent, targetDataHandle);
+            GameplayAbilities::CcClear();
             return ret;
         }
 
@@ -2315,7 +2483,10 @@ namespace Hooking {
             void* ret = reinterpret_cast<void* (__thiscall*)(UObject*, UFunction*, void*)>(origProcessEvent)(object, function, params);
 
             UAbilitySystemComponent* castObj = reinterpret_cast<UAbilitySystemComponent*>(object);
+            if (params && !IsBadReadPtr(params, 4))
+                GameplayAbilities::CcSetSource(castObj, *reinterpret_cast<int32_t*>(params), 2);
             GameplayAbilities::ForwardInputPressToTasks(castObj, origProcessEvent);
+            GameplayAbilities::CcClear();
             return ret;
         }
 
@@ -2323,7 +2494,10 @@ namespace Hooking {
             void* ret = reinterpret_cast<void* (__thiscall*)(UObject*, UFunction*, void*)>(origProcessEvent)(object, function, params);
 
             UAbilitySystemComponent* castObj = reinterpret_cast<UAbilitySystemComponent*>(object);
+            if (params && !IsBadReadPtr(params, 4))
+                GameplayAbilities::CcSetSource(castObj, *reinterpret_cast<int32_t*>(params), 3);
             GameplayAbilities::ForwardInputReleaseToTasks(castObj, origProcessEvent);
+            GameplayAbilities::CcClear();
             return ret;
         }
 
@@ -2333,10 +2507,14 @@ namespace Hooking {
             UAbilitySystemComponent* castObj = reinterpret_cast<UAbilitySystemComponent*>(object);
 
 
+            if (params && !IsBadReadPtr(params, 8))
+                GameplayAbilities::CcSetSource(castObj, *reinterpret_cast<int32_t*>(reinterpret_cast<uint8_t*>(params) + 4),
+                                               *reinterpret_cast<uint8_t*>(params));
             GameplayAbilities::ForwardInputPressToTasks(castObj, origProcessEvent);
             GameplayAbilities::ForwardInputReleaseToTasks(castObj, origProcessEvent);
 
             GameplayAbilities::TriggerAbilities(castObj);
+            GameplayAbilities::CcClear();
             return ret;
         }
         static UClass* orionExecuteClass = nullptr;
@@ -3013,6 +3191,25 @@ namespace Hooking {
             s_vehCatchCount = 0;
         }
 
+        {
+            static ULONGLONG s_staleSweepMs = 0;
+            const ULONGLONG sweepNowMs = GetTickCount64();
+            if (GameplayAbilities::ENABLE_STALE_TASK_SKIP && sweepNowMs - s_staleSweepMs >= 1000) {
+                s_staleSweepMs = sweepNowMs;
+                for (auto it = GameplayAbilities::targetingTasks.begin(); it != GameplayAbilities::targetingTasks.end(); ) {
+                    if (GameplayAbilities::TaskIsStale(reinterpret_cast<UObject*>(*it))) it = GameplayAbilities::targetingTasks.erase(it); else ++it;
+                }
+                for (auto it = GameplayAbilities::deferredConfirms.begin(); it != GameplayAbilities::deferredConfirms.end(); ) {
+                    if (GameplayAbilities::TaskIsStale(reinterpret_cast<UObject*>(it->task))) it = GameplayAbilities::deferredConfirms.erase(it); else ++it;
+                }
+                for (std::vector<UObject*>* v : { &GameplayAbilities::waitTargetDataTasks, &GameplayAbilities::waitInputPressTasks, &GameplayAbilities::waitInputReleaseTasks }) {
+                    for (auto it = v->begin(); it != v->end(); ) {
+                        if (GameplayAbilities::TaskIsStale(*it)) it = v->erase(it); else ++it;
+                    }
+                }
+            }
+        }
+
         std::vector<UOrionAbilityTask_StartTargeting*> ready;
         for (auto it = GameplayAbilities::deferredConfirms.begin();
             it != GameplayAbilities::deferredConfirms.end(); ) {
@@ -3037,12 +3234,21 @@ namespace Hooking {
                 }
             }
             if (taskStillAlive) {
-
+                if (GameplayAbilities::TaskIsStale(reinterpret_cast<UObject*>(dTask))) continue;
 
                 {
                     std::string s13d_ab;
                     if (dTask->Ability) s13d_ab = dTask->Ability->GetFullName();
                     const bool s13d_rev = GameplayAbilities::s13_NeedsForceDeliver(s13d_ab);
+                    {
+                        auto ap = GameplayAbilities::aimPending.find(dTask->AbilitySystemComponent);
+                        if (ap != GameplayAbilities::aimPending.end()) {
+                            if (g_diagTickCounter - ap->second.tick <= GameplayAbilities::PENDING_TTL_TICKS
+                                && s13d_ab.find(ap->second.entry) != std::string::npos)
+                                GameplayAbilities::AimFixMoveTm(dTask, ap->second.x, ap->second.y, ap->second.z);
+                            GameplayAbilities::aimPending.erase(ap);
+                        }
+                    }
                     if (GameplayAbilities::g_nativeReceivedReplicatedTargetData && s13d_rev) {
                         reinterpret_cast<void(__fastcall*)(UOrionAbilityTask_StartTargeting*)>(
                             GameplayAbilities::g_nativeReceivedReplicatedTargetData)(dTask);
@@ -14705,11 +14911,25 @@ else if (bIsJungler) {
                     bool isBeamAbility = target->Ability && (
                         _abFn.find("Vamp_Ultimate")         != std::string::npos ||
                         _abFn.find("Wukong_Poke")           != std::string::npos ||
-                        _abFn.find("Grux_DoublePain")       != std::string::npos ||
                         _abFn.find("Steel_Bash")            != std::string::npos ||
                         _abFn.find("HyperBreach_DetCharge") != std::string::npos ||
                         _abFn.find("Shrapnel_Ultimate")     != std::string::npos);
-                    if (isBeamAbility) {
+                    bool ccPendBlocked = false;
+                    {
+                        auto ps = GameplayAbilities::ccPendingSrc.find(target->AbilitySystemComponent);
+                        if (ps != GameplayAbilities::ccPendingSrc.end()) {
+                            if (target->Ability && ps->second && GameplayAbilities::ENABLE_SAME_ABILITY_CONFIRM
+                                && GameplayAbilities::AscIsHuman(target->AbilitySystemComponent)
+                                && reinterpret_cast<UObject*>(target->Ability)->Class != ps->second
+                                && GameplayAbilities::CcIsInputAbility(target->AbilitySystemComponent, reinterpret_cast<UObject*>(target->Ability)->Class))
+                                ccPendBlocked = true;
+                            GameplayAbilities::ccPendingSrc.erase(ps);
+                        }
+                    }
+                    if (ccPendBlocked) {
+                        GameplayAbilities::targetingTasks.push_back(target);
+                    }
+                    else if (isBeamAbility) {
                         GameplayAbilities::targetingTasks.push_back(target);
                     }
                     else {
@@ -14812,7 +15032,8 @@ else if (bIsJungler) {
                 an.find("Ghost_ScopedShot")     != std::string::npos ||
                 an.find("Shrapnel_Ultimate")    != std::string::npos ||
                 an.find("Ghost_TeleportTarget") != std::string::npos ||
-                an.find("Mambo_StabDoll")       != std::string::npos) {
+                an.find("Mambo_StabDoll")       != std::string::npos ||
+                an.find("Grux_DoublePain")      != std::string::npos) {
                 *reinterpret_cast<uint8_t*>(a1 + 0x2A8) = 1;
                 return 0;
             }
@@ -14885,7 +15106,7 @@ else if (bIsJungler) {
 
     void* origTArrayRemoveSound = nullptr;
     bool TArrayRemoveSoundHook(__int64 a1, __int64 a2) {
-        return 1;
+        return reinterpret_cast<bool(*)(__int64, __int64)>(origTArrayRemoveSound)(a1, a2);
     }
 
     static UOrionHeroData* botHeroDataOverride = nullptr;

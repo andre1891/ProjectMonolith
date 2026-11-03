@@ -218,6 +218,62 @@ namespace Hooking {
         if (f.is_open()) f << line << "\n";
     }
 
+    static bool ClientIsLive(void* p) {
+        if (!p || IsBadReadPtr(p, sizeof(UObject))) return false;
+        UObject* o = reinterpret_cast<UObject*>(p);
+        return UObject::GObjects->GetByIndex(o->Index) == o;
+    }
+
+    static bool ClientIsCallable(UObject* o) {
+        if (!ClientIsLive(o)) return false;
+        if (static_cast<int32>(o->Flags) & (0x10 | 0x8000 | 0x10000)) return false;
+        FUObjectItem* items = UObject::GObjects->GetDecrytedObjPtr();
+        if (!items || o->Index < 0 || o->Index >= UObject::GObjects->Num()) return false;
+        const uint8_t* item = reinterpret_cast<const uint8_t*>(&items[o->Index]);
+        if (IsBadReadPtr(item, 0x18)) return false;
+        const int32 itemFlags = *reinterpret_cast<const int32*>(item + 0x8);
+        return (itemFlags & ((1 << 28) | (1 << 29))) == 0;
+    }
+
+    static const bool ENABLE_REVULT_SHADE_FIX = true;
+    static void ClientRevUltShadeFix() {
+        static UObject* s_fxPc = nullptr;
+        static ULONGLONG s_fxPcMs = 0;
+        static std::vector<UObject*> s_fxChars;
+        static ULONGLONG s_fxCharsMs = 0;
+        const ULONGLONG nowMs = GetTickCount64();
+        APawn* me = ClientIsLive(s_fxPc) ? reinterpret_cast<APlayerController*>(s_fxPc)->Pawn : nullptr;
+        if (!ClientIsLive(me) && nowMs - s_fxPcMs >= 2000) {
+            s_fxPcMs = nowMs;
+            s_fxPc = nullptr;
+            for (AOrionPlayerController_Game* pc : SDKUtils::GetAllObjectsOfType<AOrionPlayerController_Game>()) {
+                UObject* po = reinterpret_cast<UObject*>(pc);
+                if (ClientIsLive(po) && !(static_cast<int32>(po->Flags) & 0x10)) s_fxPc = po;
+            }
+            me = ClientIsLive(s_fxPc) ? reinterpret_cast<APlayerController*>(s_fxPc)->Pawn : nullptr;
+        }
+        if (!ClientIsLive(me) || !me->IsA(AOrionChar::StaticClass())
+            || !(*reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(me) + 0x7D5) & 0x8)) {
+            s_fxChars.clear();
+            return;
+        }
+        if (s_fxChars.empty() || nowMs - s_fxCharsMs >= 1000) {
+            s_fxChars.clear();
+            for (AOrionChar* c : SDKUtils::GetAllObjectsOfType<AOrionChar>())
+                if (ClientIsLive(c) && c->GetFullName().find("Default__") == std::string::npos)
+                    s_fxChars.push_back(reinterpret_cast<UObject*>(c));
+            s_fxCharsMs = nowMs;
+        }
+        for (UObject* o : s_fxChars) {
+            if (!ClientIsCallable(o)) continue;
+            const uint8_t inZone = *reinterpret_cast<const uint8_t*>(reinterpret_cast<uintptr_t>(o) + 0x7D5);
+            if (!(inZone & 0x8)) continue;
+            AOrionChar* c = reinterpret_cast<AOrionChar*>(o);
+            if (!c->GetLocalStatus(EOrionCharLocalStatusTypes::IsShade)) continue;
+            c->ChangeLocalStatus(EOrionCharLocalStatusTypes::IsShade, false);
+        }
+    }
+
     void* origProcessEvent = nullptr;
 
     void* ProcessEventHook(UObject* object, UFunction* function, void* params) {
@@ -237,6 +293,15 @@ namespace Hooking {
         if (funcNameIt == s_funcNameCache.end())
             funcNameIt = s_funcNameCache.emplace(function, function->GetFullName()).first;
         const std::string& funcName = funcNameIt->second;
+
+        if (ENABLE_REVULT_SHADE_FIX) {
+            static ULONGLONG s_fxLastMs = 0;
+            const ULONGLONG fxNowMs = GetTickCount64();
+            if (fxNowMs - s_fxLastMs >= 100) {
+                s_fxLastMs = fxNowMs;
+                ClientRevUltShadeFix();
+            }
+        }
 
   
         if (funcName.find("OnCardShopOpened") != std::string::npos) {
